@@ -1,0 +1,63 @@
+Phase 0: SetUp
+    -A reproducible dev environment where any teammate can git clone && docker compose up and have a working stack ready in minutes — except now Ollama runs on the host for GPU speed, and Langfuse is in the cloud for zero ops burden.
+    -One-line DoD: git clone && cd infra && docker compose up → 5 services green + Ollama on host responding + Langfuse Cloud traces flowing.
+
+
+Day 1: Windows machine configured, repo creation, all 3 datastores (Postgres / Redis / Qdrant) running and healthy.
+    S1 - WSL2 Memory Tuning :  [wsl2]
+                            memory=9GB
+                            processors=4
+                            swap=4GB
+
+    S2 - Install Ollama Natively on Windows (NOT in Docker) : On Host
+        -> Problem With : Docker-Ollama on Windows (Every Layer Adds Latency)
+                Docker Desktop on Windows = WSL2 VM running Linux = container inside that Linux VM. For an Ollama container to access your NVIDIA GPU, the call path is
+                    App code (in container)
+                        → container runtime (in WSL2)
+                            → WSL2 VM (with GPU passthrough)
+                                → Windows NVIDIA driver
+                                    → RTX 3050 GPU
+
+        -> Solution With : host-native Ollama (One network hop vs. multi-layer virtualization. 5–7× speedup)
+                Ollama as a regular Windows app has direct GPU access via the Windows NVIDIA driver. The call path is:
+                    Docker container (your FastAPI backend)
+                        → host.docker.internal (crosses the WSL2/network boundary once)
+                            → Ollama on Windows host
+                                → Windows NVIDIA driver
+                                    → RTX 3050 GPU
+
+        -> Configure OLLAMA_HOST=0.0.0.0:11434 (not the default 127.0.0.1)
+                127.0.0.1 (localhost) — only accepts connections from processes on the same machine (same network namespace)
+                0.0.0.0 — accepts connections from any IP, including Docker's virtual network
+
+        -> Setup Steps:
+            1. Install Ollama for Windows
+            2. Run "OllamaSetup.exe" and Install 
+            3. Set env variable : [Variable name: OLLAMA_HOST , Variable value: 0.0.0.0:11434]
+            4. Relaunch and verify(model running) : curl http://localhost:11434/api/tags -> returns  {"models":[]}
+
+        ** "In production, LLM inference runs on dedicated compute clusters — vLLM on Kubernetes, Triton Inference Server, or managed endpoints — 
+            decoupled from the application and ingestion layer. We mirrored that decoupling: state, search, and background workers in Docker, 
+            while serving the model from a separate endpoint with direct GPU passthrough. Same architectural pattern, just on a dev-laptop scale."
+
+
+    S3 - Pulling Three Ollama Models using script (scripts/pull_models.sh)
+        ->  qwen2.5:3b-instruct (Primary LLM):
+                3 billion parameters at Q4 quantization =around= 2.2GB
+                "Instruct" tuned - follows instructions well for routing and grading tasks
+                "Small fast model for routing/grading, large slow model for final answer" — same pattern GPT-4 + GPT-3.5 used in early ChatGPT
+
+        ->  llama3.1:8b (Heavy reasoning):
+                8B parameters, Q4 quantized = 4.7GB
+                Used only for: final user-facing answer generation in Phase 4, eval suite in Phase 7
+                this model included for hard question to deliver quality not speed
+        
+        ->  bge-m3 (Embeddings):
+                BAAI's multilingual embedding model — works for English, Chinese, 100+ languages
+                Produces 1024-dim dense vectors - semantic balance small enough for speed, big enough for nuance
+                Also produces sparse vectors (BM25-style) in the same call — rare feature
+                Hybrid (dense + sparse) = best of both worlds: semantic understanding + exact keyword matc
+
+        ->  Setup steps:
+                1. Pull directly using the ollama CLI in PowerShell (one by one) || 
+                2. Run the script (PowerShell) : bash scripts/pull_models.sh  || one by one ollama pull
