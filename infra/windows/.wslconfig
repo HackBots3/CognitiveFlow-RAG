@@ -1,0 +1,6 @@
+# WSL2 memory tuning : Use This Reference
+
+[wsl2]
+memory=9GB
+processors=4
+swap=4GB

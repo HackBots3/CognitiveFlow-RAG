@@ -60,4 +60,42 @@ Day 1: Windows machine configured, repo creation, all 3 datastores (Postgres / R
 
         ->  Setup steps:
                 1. Pull directly using the ollama CLI in PowerShell (one by one) || 
-                2. Run the script (PowerShell) : bash scripts/pull_models.sh  || one by one ollama pull
+                2. Run the script (PowerShell) : bash scripts/pull_models.sh  || one by one "ollama pull ..."
+
+    S4 - Save docker-compose.yml ((5 services, ~1.2GB idle RAM) plus .env.example)
+        -> Services:
+            -postgres:16-alpine:
+                Alpine variant = 80MB image vs 400MB+ standard — saves disk and RAM
+                Postgres 16 = latest stable, JSONB improvements, better query performance
+                Stores: documents metadata, chunks (with full text), queries history, eval results
+                Volume postgres_data = data survives across container restarts
+                Healthcheck pg_isready = backend waits for Postgres to be ready before starting
+
+            -redis:redis-stack-server:7.4.0-v0:
+                "stack-server" = includes RediSearch module (we need it for semantic cache in Phase 5)
+                "server-only" (no UI) = saves ~100MB RAM vs full redis-stack with RedisInsight UI
+                Two roles: (1) Celery broker (task queue), (2) future semantic cache for chat
+                Volume redis_data = task results persist across restarts
+
+            -qdrant/qdrant:v1.10.0:
+                v1.10 has stable native hybrid vector support (dense + sparse in one collection)
+                Two ports: 6333 (HTTP API + dashboard) + 6334 (gRPC — faster for bulk upserts)
+                Why Qdrant over Pinecone/Weaviate? Open-source, runs locally, native hybrid search
+                Volume qdrant_data = vectors survive across restarts
+                
+            -backend (FastAPI) - we'll wire this in Day 2:
+                Builds from ../backend/Dockerfile:
+                extra_hosts: host.docker.internal:host-gateway = lets backend reach Ollama on host
+                Env vars pass through: DATABASE_URL, REDIS_URL, QDRANT_URL, OLLAMA_URL, etc.
+                Volume mounts source code so hot-reload works (edit code → uvicorn reloads instantly)
+                --reload flag = dev mode, picks up changes without rebuild
+
+            -celery_worker - we'll wire this in Day 3:
+                Same Dockerfile as backend (uses same code)
+                Different command: celery -A app.workers.celery_app worker
+                concurrency=2 = handle 2 tasks in parallel (matches our 4GB VRAM budget — each embedding job needs RAM)
+                Why same image? Celery imports from app code — no need for a separate Dockerfile
+
+        -> Setup steps:
+                1.  docker compose up -d postgres redis qdrant (Boots 3 reqiured datastores first)
+                2. Then Use up via [docker compose up/down]
