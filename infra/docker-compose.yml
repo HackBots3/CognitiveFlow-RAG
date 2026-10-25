@@ -1,0 +1,110 @@
+version: "3.9"  # Tells Docker Compose which schema to use , 3.9 is the latest stable
+
+services:
+  # STORAGE & SEARCH (Lean Stack)
+  postgres:
+    image: postgres:16-alpine
+    container_name: cf_postgres
+    environment:
+      POSTGRES_USER: cognitive
+      POSTGRES_PASSWORD: cognitive
+      POSTGRES_DB: cognitiveflow
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cognitive -d cognitiveflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis/redis-stack-server:7.4.0-v0  # server-only, no UI = smaller
+    container_name: cf_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  qdrant:
+    image: qdrant/qdrant:v1.10.0
+    container_name: cf_qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:6333/healthz || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # APP GATEWAY & WORKER
+  backend:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: cf_backend
+    depends_on:   # Backend waits for Postgres, Redis, Qdrant to be healthy, not just started
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"  # Reach Ollama on Windows host: let containers reach localhost on window host
+                                             # Without this, OLLAMA_URL=http://host.docker.internal:11434 won't resolve from inside a container
+    environment:
+      - DATABASE_URL=postgresql://cognitive:cognitive@postgres:5432/cognitiveflow
+      - REDIS_URL=redis://redis:6379/0
+      - QDRANT_URL=http://qdrant:6333
+      - OLLAMA_URL=http://host.docker.internal:11434
+      - LANGFUSE_HOST=${LANGFUSE_HOST}
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY}
+      - APP_ENV=development
+      - LOG_LEVEL=INFO
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../backend:/app
+      - ../data/uploads:/app/uploads
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  celery_worker:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: cf_celery
+    depends_on:
+      backend:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - DATABASE_URL=postgresql://cognitive:cognitive@postgres:5432/cognitiveflow
+      - REDIS_URL=redis://redis:6379/0
+      - QDRANT_URL=http://qdrant:6333
+      - OLLAMA_URL=http://host.docker.internal:11434
+      - APP_ENV=development
+    volumes:
+      - ../backend:/app
+      - ../data/uploads:/app/uploads
+    command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=2
+
+volumes:
+  postgres_data:
+  redis_data:
+  qdrant_data:
