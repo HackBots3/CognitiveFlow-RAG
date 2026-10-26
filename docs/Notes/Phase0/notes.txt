@@ -1,3 +1,4 @@
+WHAT , WHY , HOW !?
 Phase 0: SetUp
     -A reproducible dev environment where any teammate can git clone && docker compose up and have a working stack ready in minutes — except now Ollama runs on the host for GPU speed, and Langfuse is in the cloud for zero ops burden.
     -One-line DoD: git clone && cd infra && docker compose up → 5 services green + Ollama on host responding + Langfuse Cloud traces flowing.
@@ -40,7 +41,6 @@ Day 1: Windows machine configured, repo creation, all 3 datastores (Postgres / R
             decoupled from the application and ingestion layer. We mirrored that decoupling: state, search, and background workers in Docker, 
             while serving the model from a separate endpoint with direct GPU passthrough. Same architectural pattern, just on a dev-laptop scale."
 
-
     S3 - Pulling Three Ollama Models using script (scripts/pull_models.sh)
         ->  qwen2.5:3b-instruct (Primary LLM):
                 3 billion parameters at Q4 quantization =around= 2.2GB
@@ -62,7 +62,7 @@ Day 1: Windows machine configured, repo creation, all 3 datastores (Postgres / R
                 1. Pull directly using the ollama CLI in PowerShell (one by one) || 
                 2. Run the script (PowerShell) : bash scripts/pull_models.sh  || one by one "ollama pull ..."
 
-    S4 - Save docker-compose.yml ((5 services, ~1.2GB idle RAM) plus .env.example)
+    S4 - Write & Save docker-compose.yml ((5 services, ~1.2GB idle RAM) plus .env.example)
         -> Services:
             -postgres:16-alpine:
                 Alpine variant = 80MB image vs 400MB+ standard — saves disk and RAM
@@ -99,3 +99,192 @@ Day 1: Windows machine configured, repo creation, all 3 datastores (Postgres / R
         -> Setup steps:
                 1.  docker compose up -d postgres redis qdrant (Boots 3 reqiured datastores first)
                 2. Then Use up via [docker compose up/down]
+
+
+Day 2: Backend boots cleanly, GET /health verifies all 4 dependencies (Postgres, Redis, Qdrant, Ollama) report ok, Docker stack shows 5 green services.
+    S1 - Creating "backend/pyproject.toml" declaring all Python dependencies
+        -> FastAPI stack:
+            fastapi>=0.115 — Web framework. Async, OpenAPI docs for free, SSE-native (we need SSE for Phase 5 streaming)
+            uvicorn[standard]>=0.32 — ASGI server. The [standard] extra includes httptools + uvloop for ~2× faster request handling
+            pydantic>=2.9 — Type validation. FastAPI depends on it; we also use it directly for settings
+            pydantic-settings>=2.5 — Loads config from env vars + .env files
+
+        -> Database:
+            sqlalchemy>=2.0 — ORM. v2 has fully async support — important for FastAPI
+            alembic>=1.13 — Migration tool. We'll use in Phase 1 for schema migrations
+            psycopg2-binary>=2.9 — Sync Postgres driver (used by Alembic migrations which can't run async)
+            asyncpg>=0.30 — Async Postgres driver (used by FastAPI at runtime)
+        
+        -> Cache + Broker + Vector DB:
+            redis>=5.0 — Redis client with async support (redis.asyncio)
+            qdrant-client>=1.11 — Qdrant client, hybrid-vector-aware
+            celery>=5.4 — Distributed task queue. Survives worker crashes via Redis persistence
+
+        -> LLM + Embeddings + Reranker:
+            langchain>=0.3 + langchain-core>=0.3 — LLM orchestration primitives
+            langchain-ollama>=0.2 — Ollama integration for LangChain
+            langgraph>=0.2 — THE agentic framework. Cyclic state machine (not just chains) — this is what makes the project "agentic" not just "RAG with extra steps"
+            langfuse>=2.50 — Tracing SDK. Same SDK works for cloud + self-host
+            sentence-transformers>=3.1 — For loading bge-reranker-base from HuggingFace
+            rank-bm25>=0.2.2 — Pure-Python BM25 (fallback if Qdrant sparse has issues)
+
+        -> Document parsing (Phase 2):
+            pypdf>=5.0 — PDF text extraction    
+            unstructured>=0.15 — Handles PDF/DOCX/PPTX/HTML/etc. with one API
+            tiktoken>=0.7 — OpenAI's tokenizer. Used for accurate chunk-size counting
+
+        -> Misc infrastructure:
+            httpx>=0.27 — Async HTTP client (used for calling Ollama REST API directly)
+            structlog>=24.4 — Structured logging (JSON output for prod parsing)
+            tavily-python>=0.5 — Web search fallback client (1000 free queries/mo)
+
+        -> Eval (Phase 7):
+            ragas>=0.2 — RAG evaluation framework. Faithfulness, answer relevance, context precision
+
+        -> Test:
+            pytest>=8.3 — Test runner
+            pytest-asyncio>=0.24 — Async test support
+
+        -> [tool.pytest.ini_options] this block is because
+            asyncio_mode = "auto"
+                Without this, every async test needs @pytest.mark.asyncio decorator
+                With auto mode, pytest-asyncio auto-detects async tests — less boilerplate
+                Critical when we write smoke tests
+        
+        -> (No install needed locally — the Dockerfile installs deps in the container)
+            || To install locally for IDE autocompletion (optional) if anyone wants
+                cd backend
+                python -m venv .venv
+                .venv\Scripts\activate    # Windows
+                pip install -e .
+                # OR faster: uv pip install -e .
+
+    S2 - "backend/Dockerfile" that:
+            Inherits from python:3.11-slim (small base image ~50MB)
+            Installs system packages needed by Python deps
+            Installs uv (fast Python package installer)
+            Copies pyproject.toml first, installs deps, then copies app code
+        
+        -> FROM python:3.11-slim
+            Python 3.11 = best performance (10–60% faster than 3.10) + matches requires-python = ">=3.11" in pyproject
+            slim variant = no full Debian/Ubuntu — only minimal packages needed to run Python
+            Saves ~700MB vs python:3.11 full image
+
+        -> System packages installed:
+            build-essential — gcc/make. Needed by some Python packages with C extensions (lxml, etc.)
+            curl — for healthchecks and downloading things
+            poppler-utils — PDF rendering (used by unstructured + pypdf)
+            libpq-dev — Postgres headers (needed to compile psycopg2)
+            git — some pip packages install from git URLs
+            --no-install-recommends + rm -rf /var/lib/apt/lists/* — keep image lean
+
+        -> uv for pip install
+            10–100× faster than pip (Rust-based)
+            Same pyproject.toml format, just faster
+            Falls back to pip behavior when needed
+            Industry-standard now (recommended by Django, FastAPI teams)
+
+        -> Why copy pyproject.toml BEFORE app code?
+            Docker layer caching: if pyproject.toml didn't change, the uv pip install layer is cached
+            Speeds up rebuilds dramatically — code changes don't trigger full reinstall
+            This is the #1 Dockerfile optimization for Python apps
+            
+        -> EXPOSE 8000
+            Documentation-only — doesn't actually publish the port
+            Compose file maps 8000:8000 for real
+
+        -> Save and Build backend/Dockerfile
+
+    S3 - "backend/app/config.py" - A Pydantic Settings class that:
+            Reads all env vars (Postgres URL, Redis URL, Ollama URL, etc.) -> lead with defaults
+            Provides sensible defaults
+            Exposes a singleton settings instance imported across the app
+
+        -> The problem with os.getenv:
+            # Bad pattern — scattered across codebase
+            database_url = os.getenv("DATABASE_URL")
+            if not database_url:
+                raise RuntimeError("DATABASE_URL not set")
+            # No type validation, no defaults, no .env file loading, error at runtime not startup
+
+        -> Pydantic Settings solves all of this:
+            # Good — one place, type-validated, .env-aware
+            class Settings(BaseSettings):
+                database_url: str        # Required, fails at startup if missing
+                ollama_url: str = "http://host.docker.internal:11434"  # Default value
+
+        -> WHY SettingsConfigDict(env_file=".env", extra="ignore")
+            env_file=".env" — automatically reads .env file if present (local dev convenience)
+            extra="ignore" — if env vars exist that aren't in our Settings class, don't error (Docker passes many vars we don't care about)
+            Without extra="ignore", an unknown env var like PATH=/usr/bin would cause validation errors
+
+        -> WHY a module-level settings = Settings() instance
+            Singleton pattern — instance created once at module import
+            All other modules import: from app.config import settings
+            Reads env vars exactly once at startup (fail-fast)
+            No need to pass settings through function arguments everywhere
+
+        -> Save and verify imports:
+            cd backend
+            python -c "from app.config import settings; print(settings.app_name)"
+            # Should print: CognitiveFlow
+
+    S4 - "backend/app/main.py" (FastAPI App + /health Endpoint)
+            A FastAPI application with:
+                A lifespan async context manager that creates DB engine, Redis client, Qdrant client at startup, disposes at shutdown
+                CORS middleware (allows all origins in dev — tighten in prod)
+                A /health endpoint that pings all 4 deps and returns their status
+
+        -> Save & verify syntax 
+
+    S5 - Filling .env with required "Tavily" and "Langfuse Cloud"
+        -> Filling "TAVILY_API_KEY" obtained fromsite
+
+        -> Langfuse Cloud (not self-hosted)
+            Self-hosted Langfuse = 3 containers (~2GB RAM):
+                langfuse-web (Next.js app)
+                langfuse-worker (background job processor)
+                clickhouse (analytics database — ~1GB alone)
+
+            Langfuse Cloud free tier:
+                50,000 observations/month (an observation = a span or trace)
+                Same SDK as self-hosted (zero code changes if you switch later)
+                Same UI/UX
+                Zero ops burden (no upgrades, no backups, no ClickHouse tuning)
+                Production analogy: "Same trade-off as using Datadog vs. self-hosting Prometheus — pay for convenience during dev, evaluate self-hosting for prod when data residency matters."
+
+        -> creating and filling key's 
+
+    S5 - Boot Backend & verify
+        -> Build the backend image:
+            cd infra
+            docker compose build backend
+
+        -> Boot the full stack:
+            docker compose up -d
+            # Boots: postgres, redis, qdrant, backend, celery_worker
+            # (celery will fail to start because we haven't written celery_app.py yet — that's Day 3)
+
+        -> Watch backend logs:
+            docker compose logs -f backend
+            # Should see: "🚀 CognitiveFlow starting in development mode"
+            # Then: "Uvicorn running on http://0.0.0.0:8000"
+        
+        -> Hit /health endpoint:
+            curl http://localhost:8000/health
+            Expected response (all 4 deps ok):
+            json
+            {
+                "service": "CognitiveFlow",
+                "env": "development",
+                "postgres": "ok",
+                "redis": "ok",
+                "qdrant": "ok",
+                "ollama": "ok (3 models)",
+                "status": "ok"
+            }
+    
+        -> Browse the auto-generated OpenAPI docs:
+            http://localhost:8000/docs — Swagger UI
+            http://localhost:8000/redoc — ReDoc (cleaner read-only view)
+            Both are free with FastAPI — no extra code needed

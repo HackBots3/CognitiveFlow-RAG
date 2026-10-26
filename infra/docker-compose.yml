@@ -41,7 +41,7 @@ services:
     volumes:
       - qdrant_data:/qdrant/storage
     healthcheck:
-      test: ["CMD-SHELL", "curl -fs http://localhost:6333/healthz || exit 1"]
+      test: ["CMD-SHELL", "bash -c ': > /dev/tcp/127.0.0.1/6333' || exit 1"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -63,7 +63,7 @@ services:
       - "host.docker.internal:host-gateway"  # Reach Ollama on Windows host: let containers reach localhost on window host
                                              # Without this, OLLAMA_URL=http://host.docker.internal:11434 won't resolve from inside a container
     environment:
-      - DATABASE_URL=postgresql://cognitive:cognitive@postgres:5432/cognitiveflow
+      - DATABASE_URL=postgresql+asyncpg://cognitive:cognitive@postgres:5432/cognitiveflow
       - REDIS_URL=redis://redis:6379/0
       - QDRANT_URL=http://qdrant:6333
       - OLLAMA_URL=http://host.docker.internal:11434
