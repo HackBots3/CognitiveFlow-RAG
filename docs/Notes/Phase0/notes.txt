@@ -255,7 +255,7 @@ Day 2: Backend boots cleanly, GET /health verifies all 4 dependencies (Postgres,
 
         -> creating and filling key's 
 
-    S5 - Boot Backend & verify
+    S6 - Boot Backend & verify
         -> Build the backend image:
             cd infra
             docker compose build backend
@@ -288,3 +288,257 @@ Day 2: Backend boots cleanly, GET /health verifies all 4 dependencies (Postgres,
             http://localhost:8000/docs — Swagger UI
             http://localhost:8000/redoc — ReDoc (cleaner read-only view)
             Both are free with FastAPI — no extra code needed
+
+
+Day 3: Qdrant collection created (hybrid schema with dense + sparse vectors), Celery worker executes ping task, all 7 pytest smoke tests green.
+    S1 - "scripts/seed_qdrant.sh"
+        A bash script that calls Qdrant's REST API to create the docs collection with hybrid schema — meaning it stores BOTH:
+            Dense vectors (1024-dim Cosine) — semantic similarity
+            Sparse vectors (BM25-style indices) — exact keyword match
+
+        Hybrid = both: dense catches semantic meaning, sparse catches exact keywords, you fuse the rankings.
+        
+        -> WHY specific schema choices
+            {
+              "vectors": {
+                "dense": {"size": 1024, "distance": "Cosine"}
+              },
+              "sparse_vectors": {
+                "sparse": {}
+              }
+            }
+            size: 1024 — matches bge-m3 embedding dimension. Mismatch = upsert fails.
+            distance: "Cosine" — for semantic similarity, cosine is the standard. L2 (Euclidean) overweights vector magnitude. Dot product requires normalized vectors.
+            sparse: {} — empty config = use Qdrant's default sparse config. We'll provide the sparse vectors ourselves (from bge-m3's sparse output).
+
+        -> WHY this is a one-time script (not a migration)
+            Qdrant is schema-as-code — collections live in storage, not source control
+            Running it twice with PUT is idempotent — overwrites the collection (warning: deletes points)
+            This is "infrastructure as code" for vectors — same pattern as CREATE TABLE SQL scripts
+
+        -> Save and Run the Script:
+            bash scripts/seed_qdrant.sh
+           Verify:
+            Verify in Qdrant dashboard: Browser → http://localhost:6333/dashboard → should see docs collection listed
+
+    S2 - "backend/app/workers/celery_app.py" (fixes the crashing Celery container)
+        A Python module that:
+            Creates a Celery instance with Redis as both broker (task queue) and backend (result store)
+            Configures task serialization, timezone, routing
+            Defines a ping task that returns "pong"
+    
+        -> Why each config setting:
+            task_track_started=True — Without this, a task goes PENDING → SUCCESS/FAILURE, skipping STARTED. With it, you can see "task X is currently running" in monitoring.
+            
+            task_serializer="json" — Default is pickle (Python-only, security risk). JSON is cross-language and safe. Trade-off: can't serialize complex Python objects, but our tasks only use dicts/lists/strings.
+
+            accept_content=["json"] — Only accept JSON-serialized tasks. Older workers accepting pickle = security hole (deserialization RCE). Lock down early.
+
+            timezone="UTC" — All timestamps in UTC. Avoids "task scheduled at 9 AM EST ran at 2 PM UTC" bugs.
+
+            task_routes — Sends app.ingestion.tasks.* to a dedicated ingestion queue. Lets you scale ingestion workers separately from other workers. Phase 2 will add the actual ingestion task here.
+
+        -> WHY Redis as both broker AND backend
+            Broker: Where tasks get enqueued (the queue)
+            Backend: Where results get stored after task completes
+
+        -> Using Redis for both is fine for dev (one less service). In production:
+            Broker: Redis or RabbitMQ (RabbitMQ is more robust for high-volume)
+            Backend: Postgres or dedicated result store (Redis is fine for short-lived results)
+
+        -> WHY a ping task
+            Simplest possible task — no DB calls, no LLM calls, just returns a string
+            Tests the full Celery wiring: broker → worker → backend → result retrieval
+            If ping works, you know Redis is reachable, worker is alive, serialization works, result backend works
+            Same pattern as /health endpoint — fail loudly, fail specifically
+
+        -> Save the file at backend/app/workers/celery_app.py
+            Restart celery container:
+                cd infra
+                docker compose restart celery_worker
+                docker compose logs -f celery_worker
+
+    S3 - "backend/tests/test_smoke_ollama.py" (4 tests)
+        Four pytest tests verifying host-native Ollama:
+            test_ollama_is_running — service responds on :11434
+            test_ollama_has_required_models — all 3 models pulled
+            test_ollama_chat_responds — qwen2.5:3b generates valid content
+            test_ollama_embed_returns_vector — bge-m3 returns 1024-dim vector
+
+        -> WHY each test exists
+            1. test_ollama_is_running — Proves Ollama is up. Without this, every other test fails confusingly with "connection refused." This test isolates the "is Ollama even running?" question.
+
+            2. test_ollama_has_required_models — Proves Day 1 Step 1.3 succeeded. If models aren't pulled, you'd get 404 from /api/chat. This catches "I forgot to run pull_models.sh" before it bites.
+
+            3. test_ollama_chat_responds — End-to-end LLM test. Asks qwen2.5 to say a specific phrase. Verifies:
+                Model loads (first call takes 5–10s as model loads into VRAM)
+                Inference completes (proves GPU working)
+                Response contains expected content (proves the model isn't broken)
+                Round-trip < 60s timeout (catches GPU/CPU split thrash)
+            
+            4. test_ollama_embed_returns_vector — Proves embeddings work AND the dimension matches our Qdrant collection schema (1024). If bge-m3 returned 768-dim, every upsert in Phase 2 would fail.
+
+        -> WHY hardcoded URLs (not from settings)
+            OLLAMA_URL = "http://localhost:11434"  # hardcoded, not settings.ollama_url
+            Tests run from host (not in Docker container)
+            From host, Ollama is at localhost:11434
+            Settings has http://host.docker.internal:11434 (Docker-internal DNS)
+            Tests must use the host-accessible URL, not the container-accessible URL
+
+        -> WHY stream: False in chat test
+            json={"model": "qwen2.5:3b-instruct", "messages": [...], "stream": False}
+            stream: True returns NDJSON chunks (one per token) — complex to parse in a test
+            stream: False waits for full response, returns single JSON — simple assertion
+            Production code (Phase 5) WILL use streaming for SSE chat — tests don't need to
+
+        -> WHY timeout=60.0 for chat
+            First call loads model into VRAM: 5–10s
+            Generation: ~1s for short response
+            60s timeout gives 6× headroom for slow disk/network
+            Without timeout, a hung Ollama would block the test forever
+
+        -> Save the file at "backend/tests/test_smoke_ollama.py"
+            Run from host (requires Python 3.11 + httpx installed):
+                cd backend
+                pip install pytest httpx
+                pytest tests/test_smoke_ollama.py -v
+
+    S4 - "backend/tests/test_smoke_qdrant.py" (2 tests)
+        Two tests:
+            test_qdrant_collection_exists — docs collection present
+            test_qdrant_collection_has_hybrid_schema — both dense + sparse vectors configured
+    
+        -> WHY these tests
+            1. test_qdrant_collection_exists — Proves Step 3.1 (seed_qdrant.sh) succeeded. If collection missing, every upsert in Phase 2 fails.
+            2. test_qdrant_collection_has_hybrid_schema — Catches the subtle bug where you create a collection but only configure dense vectors (forgetting sparse). This would silently work for dense retrieval but break hybrid search in Phase 3.
+
+        -> WHY hardcoded URL
+        QDRANT_URL = "http://localhost:6333"  # host access, not Docker DNS
+        Same reason as Ollama tests: tests run from host, where Qdrant is at localhost:6333 (port mapped in compose).
+
+        -> WHY assert on the structure not just presence
+            sparse = info.config.params.sparse_vectors
+            assert sparse is not None, "no sparse vectors configured"
+            assert "sparse" in sparse, f"expected 'sparse' key, got {list(sparse.keys())}"
+            sparse_vectors is not None — config object exists
+            "sparse" in sparse — the specific key matches what our retrieval code expects
+            Without this check, renaming the sparse key would silently break hybrid search
+
+        -> HOW (step-by-step)
+            Save the file at backend/tests/test_smoke_qdrant.py
+            Run:
+                cd backend
+                pip install qdrant-client
+                pytest tests/test_smoke_qdrant.py -v
+
+    S5 - "backend/tests/test_smoke_celery.py" (1 test, but the most important)
+        A single end-to-end test that proves the entire Celery wiring:
+            Test enqueues ping.delay() → task pushed to Redis broker
+            Celery worker (running in Docker) picks up task
+            Worker executes ping() → returns "pong"
+            Worker stores result in Redis backend
+            Test calls result.get(timeout=10) → retrieves "pong"
+            Assert: val == "pong"
+
+        -> WHY this is the most important test
+            This single test proves 6 things simultaneously:
+                ✅ Redis is reachable (broker)
+                ✅ Redis is reachable (backend)
+                ✅ Celery worker is running
+                ✅ Worker can deserialize JSON tasks
+                ✅ Worker can serialize JSON results
+                ✅ Result backend polling works
+            If any one of these breaks, this test fails. That's the value — one test, six guarantees.
+
+        -> WHY time.sleep(2) before result.get()
+            result = ping.delay()
+            time.sleep(2)  # let worker pick up and execute
+            val = result.get(timeout=10)
+            ping.delay() returns immediately with an AsyncResult (task is queued, not done)
+            result.get(timeout=10) blocks up to 10s for the result to appear in backend
+            The time.sleep(2) is defensive — gives worker a head start
+            Without it: get(timeout=10) would still work (polls Redis every ~250ms), just slightly slower on success path
+            With it: less polling, less Redis load
+
+        -> WHY timeout=10
+            ping task takes ~50ms to execute
+            10s timeout = 200× headroom
+            If it takes longer, something is wrong (worker crash, Redis lock, etc.)
+            Don't set timeout=None (would block forever on a hung worker)
+
+        -> HOW (step-by-step)
+            Save the file at "backend/tests/test_smoke_celery.py"
+            Ensure Celery worker is running:
+                cd infra
+                1. docker compose ps celery_worker
+                # Should show: cf_celery ... Up
+                2. Run the test:
+                    cd backend
+                    make .env with:
+                        REDIS_URL, DATABASED_URL, QDRANT_URL, OLLAMA_URL
+                    pip install celery redis
+                    pytest tests/test_smoke_celery.py -v
+
+    S6: Set Up Local Python venv + Run All 7 Tests
+        Install Python deps locally (not in Docker) so you can run pytest from your IDE. Then run all 7 smoke tests.
+
+        -> WHY run tests from host, not in Docker
+            In Docker	    Same env as prod, no local setup	                        Slow iteration (rebuild image per code change), harder IDE integration
+            From host	    Fast iteration, IDE autocompletion, debugger works	        Need to install deps locally, env may differ from prod
+        
+        Best of both worlds: run from host during dev, in Docker for CI/CD.
+
+        -> WHY a venv (not system Python)
+            Isolates project deps from system Python
+            Different projects need different versions (Project A needs pydantic>=2.5, Project B needs pydantic<2)
+            venv = one command, fully reversible (delete folder)
+
+        -> HOW (step-by-step)
+            Verify Python 3.11+:
+                python --version  # or python3 --version on Linux/Mac
+                # Must be >= 3.11
+            Create venv:    
+                cd backend
+                python -m venv .venv
+
+            Activate venv:
+                # Windows PowerShell:
+       *Imp*    .venv\Scripts\Activate.ps1
+
+                # Windows Git Bash:
+                source .venv/Scripts/activate
+                # Linux/Mac:
+                source .venv/bin/activate
+
+            Prompt should change to (.venv) $
+            Install deps:
+                # Option A: Standard pip (slow, ~5 min)
+                pip install -e .
+
+                # Option B: uv (fast, ~30s) — recommended
+                pip install uv  ||  python -m pip install uv
+                uv pip install -e .
+                
+            Create backend/.env for host-accessible URLs (CRITICAL — see Step 3.5 gotchas):
+                # backend/.env  (this is DIFFERENT from infra/.env)
+                # Override Docker-internal URLs with localhost for host-based testing
+                DATABASE_URL=postgresql+asyncpg://cognitive:cognitive@localhost:5432/cognitiveflow
+                REDIS_URL=redis://localhost:6379/0
+                QDRANT_URL=http://localhost:6333
+                OLLAMA_URL=http://localhost:11434
+            
+            Pydantic Settings reads this file automatically (because of env_file=".env")
+            Add backend/.env to .gitignore (verify it's there — we did this in Day 1)
+
+            Run all smoke tests:
+                cd backend
+                pytest tests/ -v
+            
+            Expected output:
+                tests/test_smoke_ollama.py::test_ollama_is_running PASSED
+                tests/test_smoke_ollama.py::test_ollama_has_required_models PASSED
+                tests/test_smoke_ollama.py::test_ollama_chat_responds PASSED
+                tests/test_smoke_ollama.py::test_ollama_embed_returns_vector PASSED
+                tests/test_smoke_qdrant.py::test_qdrant_collection_exists PASSED
+                tests/test_smoke_qdrant.py::test_qdrant_collection_has_hybrid_schema PASSED
+                tests/test_smoke_celery.py::test_celery_ping_task_executes PASSED
