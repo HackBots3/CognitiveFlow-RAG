@@ -542,3 +542,77 @@ Day 3: Qdrant collection created (hybrid schema with dense + sparse vectors), Ce
                 tests/test_smoke_qdrant.py::test_qdrant_collection_exists PASSED
                 tests/test_smoke_qdrant.py::test_qdrant_collection_has_hybrid_schema PASSED
                 tests/test_smoke_celery.py::test_celery_ping_task_executes PASSED
+
+
+Day 4: Langfuse Cloud traces flowing from a real request + ADR + README + Sign-Off
+    S1 - Wire Langfuse into the Backend
+        -> Create backend/app/core/tracing.py:
+                get_langfuse() — singleton Langfuse client (or None if not configured)
+                trace(name) — context manager wrapping a code block as a Langfuse span
+        
+        -> Then Add a trace to /health: in "backend/app/main.py"
+            Restart backend:
+            docker compose restart backend
+
+        -> WHY a singleton client (not per-request)
+            Langfuse client opens HTTP connections + buffers spans in memory
+            Creating one per request = connection thrashing
+            Singleton = reused across requests, flushed in batches
+            Same pattern as our pg_engine, redis_client, qdrant_client
+
+        -> WHY trace() is a context manager (not a decorator)
+            Decorator pattern (limitation):
+                @trace("health-check")
+                async def health():
+                    ...
+                # Can't easily attach metadata mid-function
+        
+            Context manager pattern (flexible):
+                async def health():
+                    with trace("health-check") as span:
+                        if span:
+                            span.metadata = {"endpoint": "/health"}
+                            span.input = {"user": "test"}
+                        # ... existing logic ...
+                        if span:
+                            span.output = checks
+
+            Can attach input/output/metadata at any point inside the function
+            Can nest: with trace("request"): → with trace("db-call"): inside
+            More Pythonic — matches with open(...) pattern
+
+        -> WHY no-op fallback when Langfuse not configured
+            if lf is None:
+                yield None
+                return
+
+            If LANGFUSE_HOST is empty (e.g., running tests), trace() is a no-op
+            Code still works — just no spans emitted
+            Critical for tests: smoke tests don't need to hit Langfuse
+            Critical for local dev: developer can disable Langfuse by clearing env var
+
+        -> WHY try/except around lf.span()
+            try:
+                with lf.span(name=name) as span:
+                    yield span
+                except Exception as e:
+                logger.warning(f"Langfuse span '{name}' failed: {e}")
+                yield None
+
+            Network failures (Langfuse Cloud unreachable) shouldn't break /health
+            Tracing is observability — it should NEVER cause user-facing failures
+            This is the golden rule of observability: tracing must be best-effort
+
+    S2 - made ADR - tech stack.made
+    S3 - made README.made
+    S4 - made architecture diagram
+    S5 - "scripts/verify_phase0.sh" (DoD Verifier)
+        A bash script that runs all 8 Phase 0 DoD checks:
+            WSL2 memory cap (.wslconfig exists)
+            Ollama host-native responding
+            Required Ollama models pulled
+            Docker services healthy
+            /health endpoint returns ok
+            Qdrant docs collection exists
+            Smoke tests pass
+            Langfuse Cloud reachable
